@@ -1,5 +1,6 @@
 {-# OPTIONS_GHC -O2 #-}
 {-# LANGUAGE ScopedTypeVariables  #-}
+{-# LANGUAGE BangPatterns #-}
 
 module Main where
 
@@ -14,6 +15,10 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString.Char8 as C 
 import Data.Maybe (fromJust)
 import Data.STRef
+import           Data.Sequence (Seq, ViewL((:<)), (><))
+import qualified Data.Sequence as S
+import Data.Foldable
+import Data.Tuple
 
 import System.IO
 
@@ -38,11 +43,12 @@ main = do
         [i, j, w] <- readInts input
         writeArray capacity (i, j) w
         modifyArray graph i (j :)
-        modifyArray graph j (negate i :)
 
     c <- unsafeFreeze capacity
     g <- unsafeFreeze graph
-
+    -- print [n, m]
+    -- print c
+    -- print g
     writeFile (filename ++ ".out") (show $ maxflow c g)
 
 maxflow :: UArray (Int, Int) Int -> Array Int [Int] -> Int
@@ -50,47 +56,57 @@ maxflow capacity graph = runST $ helper capacity graph =<< newArray (bounds capa
 
 helper :: forall s. UArray (Int, Int) Int -> Array Int [Int] -> STUArray s (Int, Int) Int -> ST s Int
 helper capacity graph flow = do
-    p <- findPath capacity graph flow
-    case p of 
-        Nothing          -> return 0
-        Just ((m, path)) -> do
-            mapM_ (\(i, j) -> change i j m) $ zip path (tail path)
-            (m +) <$> helper capacity graph flow
+    parent <- newArray (bounds graph) (- 1)
+    max_flow <- newSTRef 0
+    whileM (findPath capacity graph flow parent) $ do
+        preds <- getPreds parent n
+        let indexes = zip (tail preds) preds
+        inc <- foldrM (\x acc -> min acc <$> fmap (capacity!x -) (flow<!>x)) maxBound indexes
+        forM_ indexes $ \i -> do
+            modifyArray flow i (+ inc)
+            modifyArray flow (swap i) (\x -> x - inc)
+        modifySTRef max_flow (+ inc)
+    readSTRef max_flow
     where
-        change :: Int -> Int -> Int -> ST s ()
-        change i j w 
-            | capacity!(i, j) /= 0 = modifyArray flow (i, j) (+ w)
-            | otherwise            = modifyArray flow (j, i) (\x -> x - w)
+        getPreds :: STUArray s Int Int -> Int -> ST s [Int]
+        getPreds parent (-1) = return []
+        getPreds parent i    = (i :) <$> (getPreds parent =<< to)
+            where to = readArray parent i 
+        
+        (_, n) = bounds graph
+
+(<!>) :: (MArray a e m, Ix i) => a i e -> i -> m e
+(<!>) = readArray
 
 modifyArray :: (MArray a e m, Ix i, Monad m) => a i e -> i -> (e -> e) -> m ()
 modifyArray arr i foo = readArray arr i >>= writeArray arr i . foo
 
---почему не компилится если завести runST?
-findPath :: forall s. UArray (Int, Int) Int -> Array Int [Int] -> STUArray s (Int, Int) Int -> ST s (Maybe (Int, [Int]))
-findPath capacity graph flow = do
-    visited <- newArray (bounds graph) False
-    findPath' visited 1
-    where 
-        findPath' :: STUArray s Int Bool -> Int -> ST s (Maybe (Int, [Int]))
-        findPath' visited i
-            | i == n    = return $! Just (maxBound, [n])
-            | otherwise = loop (graph!i)
-            where 
-                ((a, b), (n, k)) = bounds capacity
+-- bfs
+findPath :: forall s. UArray (Int, Int) Int -> Array Int [Int] -> STUArray s (Int, Int) Int -> STUArray s Int Int -> ST s Bool
+findPath capacity graph flow parent = do
+        color <- newArray (a, n) white
+        loop color (S.singleton a)
+        (black == ) <$> color<!>n
+    where
+        loop :: STUArray s Int Int -> Seq Int -> ST s ()
+        loop color !queue
+            | S.null queue = return ()
+            | otherwise    = do
+                let (i :< rest) = S.viewl queue
+                writeArray color i black
+                nexts <- filterM (\j -> (&&) <$> ((white ==) <$> color<!>j) <*> ((>0).(capacity!(i,j) -) <$> flow<!>(i,j))) (graph!i)
+                forM_ nexts $ \j -> do
+                    writeArray color j grey
+                    writeArray parent j i
+                loop color $ rest >< S.fromList nexts
 
-                loop :: [Int] -> ST s (Maybe (Int, [Int]))
-                loop []     = return Nothing
-                loop (x:xs) = do
-                    let j = abs x
-                    f1 <- readArray flow (i, j)
-                    f2 <- readArray flow (j, i)
-                    let m = if x > 0 then capacity!(i, j) - f1 else f2
-                    v <- readArray visited j
-                    if m == 0 || v then
-                        loop xs
-                    else do
-                        writeArray visited i True
-                        p <- findPath' visited j
-                        case p of
-                            Nothing         -> loop xs
-                            Just (m1, path) -> return $! Just (min m m1, i:path)
+        ((a, b), (n, m)) = bounds capacity
+        white = 0
+        grey  = 1
+        black = 2
+
+whileM cond action = do
+    c <- cond
+    when c $ do
+        action
+        whileM cond action
