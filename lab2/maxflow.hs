@@ -1,6 +1,5 @@
 {-# OPTIONS_GHC -O2 #-}
 {-# LANGUAGE ScopedTypeVariables  #-}
-{-# LANGUAGE BangPatterns #-}
 
 module Main where
 
@@ -22,11 +21,8 @@ import Data.Tuple
 
 import System.IO
 
-import System.CPUTime
--- import Debug.Trace
 
 filename = "maxflow"
-
 
 {-# INLINE readInts #-}
 readInts input = do
@@ -38,75 +34,92 @@ main = do
 
     [n, m]   <- readInts input
     capacity <- newArray ((1, 1), (n, n)) 0 :: IO (IOUArray (Int, Int) Int)
-    graph    <- newArray (1, n) [] :: IO (IOArray Int [Int])
     forM_ [1..m] $ \_ -> do
         [i, j, w] <- readInts input
         writeArray capacity (i, j) w
-        modifyArray graph i (j :)
 
     c <- unsafeFreeze capacity
-    g <- unsafeFreeze graph
-    -- print [n, m]
-    -- print c
-    -- print g
-    writeFile (filename ++ ".out") (show $ maxflow c g)
 
-maxflow :: UArray (Int, Int) Int -> Array Int [Int] -> Int
-maxflow capacity graph = runST $ helper capacity graph =<< newArray (bounds capacity) 0
+    writeFile (filename ++ ".out") (show $ maxflow $ c)
 
-helper :: forall s. UArray (Int, Int) Int -> Array Int [Int] -> STUArray s (Int, Int) Int -> ST s Int
-helper capacity graph flow = do
-    parent <- newArray (bounds graph) (- 1)
-    max_flow <- newSTRef 0
-    whileM (findPath capacity graph flow parent) $ do
-        preds <- getPreds parent n
-        let indexes = zip (tail preds) preds
-        inc <- foldrM (\x acc -> min acc <$> fmap (capacity!x -) (flow<!>x)) maxBound indexes
-        forM_ indexes $ \i -> do
-            modifyArray flow i (+ inc)
-            modifyArray flow (swap i) (\x -> x - inc)
-        modifySTRef max_flow (+ inc)
-    readSTRef max_flow
+maxflow :: UArray (Int, Int) Int -> Int
+maxflow capacity = runST $ dinic capacity
+
+
+bfs :: forall s. UArray (Int, Int) Int -> STUArray s (Int, Int) Int -> STUArray s Int Int -> ST s Bool
+bfs capacity flow depth = do
+        bnds <- getBounds depth
+        forM_ (range bnds) $ \i -> writeArray depth i (-1)
+        writeArray depth 1 0
+        loop (S.singleton 1)
+        (/= -1) <$> readArray depth n
     where
-        getPreds :: STUArray s Int Int -> Int -> ST s [Int]
-        getPreds parent (-1) = return []
-        getPreds parent i    = (i :) <$> (getPreds parent =<< to)
-            where to = readArray parent i 
-        
-        (_, n) = bounds graph
+        (_, (_, n)) = bounds capacity
+        loop :: Seq Int -> ST s ()
+        loop queue | S.null queue = return ()
+        loop queue = do
+            let (v :< rest) = S.viewl queue
+            next <- flip filterM [1..n] $ \to -> do
+                        dv <- readArray depth v
+                        d <- readArray depth to
+                        f <- readArray flow (v, to)
+                        let flag = d == -1 && f < capacity!(v, to)
+                        when flag $! writeArray depth to (dv + 1)
+                        return $! flag
+            loop (rest >< S.fromList next)
 
+dfs :: UArray (Int, Int) Int -> STUArray s (Int, Int) Int -> STUArray s Int Int -> STUArray s Int Int -> Int -> Int -> ST s Int
+dfs capacity flow depth ptr from maxflow = let n = (snd.snd) (bounds capacity) in
+    if (maxflow == 0 || from == n) then
+        return maxflow
+    else do
+        answer <- newSTRef 0
+        whileM ((&&)<$>((<=n) <$> ptr<!>from)<*>((==0)<$>readSTRef answer)) $ do
+            to <- ptr<!>from
+            dt <- readArray depth to
+            df <- readArray depth from
+            when (dt == df + 1) $ do
+                pushed <- dfs capacity flow depth ptr to =<< (min maxflow <$> ((capacity!(from, to) -) <$> flow<!>(from, to)))
+                x <- readArray ptr from
+                modifyArray flow (from, to) (+ pushed)
+                modifyArray flow (to, from) (\x-> x - pushed) 
+                writeSTRef answer pushed 
+            modifyArray ptr from (+ 1)
+        readSTRef answer
+
+dinic :: forall s . UArray (Int, Int) Int -> ST s Int
+dinic capacity = do
+    answer <- newSTRef 0    
+    flow  <- newArray bnds 0
+    depth <- newArray_ (1, n)
+    ptr   <- newArray_ (1, n)
+    whileM (bfs capacity flow depth) $ do
+        d <- getElems depth
+        f <- freeze flow :: ST s (UArray (Int, Int) Int)
+        forM_ (range (1, n)) $ \i -> writeArray ptr i 1
+        flag <- newSTRef True
+        whileM (readSTRef flag) $ do
+            pushed <- dfs capacity flow depth ptr 1 maxBound
+            modifySTRef answer (+ pushed)
+            writeSTRef flag (pushed > 0)
+    readSTRef answer
+
+    where
+        bnds@(_, (_, n)) = bounds capacity
+
+
+{-# INLINE (<!>) #-}
 (<!>) :: (MArray a e m, Ix i) => a i e -> i -> m e
 (<!>) = readArray
 
+whileM p f = go
+    where go = do
+            x <- p
+            if x then
+                f >> go
+            else 
+                return ()
+
+{-# INLINE modifyArray #-}
 modifyArray :: (MArray a e m, Ix i, Monad m) => a i e -> i -> (e -> e) -> m ()
 modifyArray arr i foo = readArray arr i >>= writeArray arr i . foo
-
--- bfs
-findPath :: forall s. UArray (Int, Int) Int -> Array Int [Int] -> STUArray s (Int, Int) Int -> STUArray s Int Int -> ST s Bool
-findPath capacity graph flow parent = do
-        color <- newArray (a, n) white
-        loop color (S.singleton a)
-        (black == ) <$> color<!>n
-    where
-        loop :: STUArray s Int Int -> Seq Int -> ST s ()
-        loop color !queue
-            | S.null queue = return ()
-            | otherwise    = do
-                let (i :< rest) = S.viewl queue
-                writeArray color i black
-                nexts <- filterM (\j -> (&&) <$> ((white ==) <$> color<!>j) <*> ((>0).(capacity!(i,j) -) <$> flow<!>(i,j))) (graph!i)
-                forM_ nexts $ \j -> do
-                    writeArray color j grey
-                    writeArray parent j i
-                loop color $ rest >< S.fromList nexts
-
-        ((a, b), (n, m)) = bounds capacity
-        white = 0
-        grey  = 1
-        black = 2
-
-whileM cond action = do
-    c <- cond
-    when c $ do
-        action
-        whileM cond action
